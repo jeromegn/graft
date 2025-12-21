@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Debug, ops::RangeInclusive, path::Path};
+use std::{collections::BTreeMap, fmt::Debug, ops::RangeInclusive, path::Path, sync::Arc};
 
 use crate::{
     core::{
@@ -11,9 +11,12 @@ use crate::{
         page::Page,
         pageset::PageSet,
     },
-    local::fjall_storage::{
-        fjall_typed::{ReadableExt, TypedIter, TypedKeyspace, TypedValIter, WriteBatchExt},
-        keys::PageVersion,
+    local::{
+        fjall_storage::{
+            fjall_typed::{ReadableExt, TypedIter, TypedKeyspace, TypedValIter, WriteBatchExt},
+            keys::PageVersion,
+        },
+        page_store::PageStore,
     },
 };
 use bytestring::ByteString;
@@ -31,8 +34,8 @@ use crate::{
 };
 
 mod fjall_repr;
-mod fjall_typed;
-mod keys;
+pub(crate) mod fjall_typed;
+pub(crate) mod keys;
 mod values;
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +98,10 @@ pub struct FjallStorage {
     db: fjall::Database,
     ks: Keyspaces,
 
+    /// Optional external page store. When set, page operations are delegated
+    /// to this store instead of using the internal pages keyspace.
+    page_store: Option<Arc<dyn PageStore>>,
+
     /// Must be held while performing read+write transactions.
     /// Read-only and write-only transactions don't need to hold the lock as
     /// long as they are safe:
@@ -111,20 +118,33 @@ impl Debug for FjallStorage {
 
 impl FjallStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, FjallStorageErr> {
-        Self::open_from_builder(Database::builder(path))
+        Self::open_from_builder(Database::builder(path), None)
+    }
+
+    pub fn open_with_page_store<P: AsRef<Path>>(
+        path: P,
+        page_store: Arc<dyn PageStore>,
+    ) -> Result<Self, FjallStorageErr> {
+        Self::open_from_builder(Database::builder(path), Some(page_store))
     }
 
     pub fn open_temporary() -> Result<Self, FjallStorageErr> {
         let path = tempfile::tempdir()?.keep();
-        Self::open_from_builder(Database::builder(path).temporary(true))
+        Self::open_from_builder(Database::builder(path).temporary(true), None)
     }
 
     fn open_from_builder(
         builder: fjall::DatabaseBuilder<Database>,
+        page_store: Option<Arc<dyn PageStore>>,
     ) -> Result<Self, FjallStorageErr> {
         let db = builder.open()?;
         let ks = Keyspaces::open(&db)?;
-        Ok(Self { db, ks, lock: Default::default() })
+        Ok(Self { db, ks, page_store, lock: Default::default() })
+    }
+
+    /// Returns true if this storage uses an external page store.
+    pub fn uses_external_page_store(&self) -> bool {
+        self.page_store.is_some()
     }
 
     pub(crate) fn read(&self) -> ReadGuard<'_> {
@@ -148,10 +168,22 @@ impl FjallStorage {
         pageidx: PageIdx,
         page: Page,
     ) -> Result<(), FjallStorageErr> {
-        self.ks.pages.insert(PageKey::new(sid, pageidx), page)
+        if let Some(page_store) = &self.page_store {
+            let mut pages = BTreeMap::new();
+            pages.insert(pageidx, page);
+            page_store
+                .write_segment(sid, pages)
+                .map_err(|e| FjallStorageErr::IoErr(std::io::Error::other(e.to_string())))
+        } else {
+            self.ks.pages.insert(PageKey::new(sid, pageidx), page)
+        }
     }
 
     pub fn remove_page(&self, sid: SegmentId, pageidx: PageIdx) -> Result<(), FjallStorageErr> {
+        // Note: external page stores don't support removal (pages are write-once)
+        if self.page_store.is_some() {
+            return Ok(());
+        }
         self.ks.pages.remove(PageKey::new(sid, pageidx))
     }
 
@@ -160,6 +192,10 @@ impl FjallStorage {
         sid: &SegmentId,
         pages: RangeInclusive<PageIdx>,
     ) -> Result<(), FjallStorageErr> {
+        // Note: external page stores don't support removal (pages are write-once)
+        if self.page_store.is_some() {
+            return Ok(());
+        }
         // PageKeys are stored in descending order
         let keyrange =
             PageKey::new(sid.clone(), *pages.end())..=PageKey::new(sid.clone(), *pages.start());
@@ -456,8 +492,14 @@ impl<'a> ReadGuard<'a> {
     }
 
     pub fn has_page(&self, sid: SegmentId, pageidx: PageIdx) -> Result<bool, FjallStorageErr> {
-        self.snapshot
-            .contains_key(&self.ks().pages, &PageKey::new(sid, pageidx))
+        if let Some(page_store) = &self.storage.page_store {
+            page_store
+                .has_page(&sid, pageidx)
+                .map_err(|e| FjallStorageErr::IoErr(std::io::Error::other(e.to_string())))
+        } else {
+            self.snapshot
+                .contains_key(&self.ks().pages, &PageKey::new(sid, pageidx))
+        }
     }
 
     pub fn read_page(
@@ -465,8 +507,14 @@ impl<'a> ReadGuard<'a> {
         sid: SegmentId,
         pageidx: PageIdx,
     ) -> Result<Option<Page>, FjallStorageErr> {
-        self.snapshot
-            .get_owned(&self.ks().pages, PageKey::new(sid, pageidx))
+        if let Some(page_store) = &self.storage.page_store {
+            page_store
+                .read_page(&sid, pageidx)
+                .map_err(|e| FjallStorageErr::IoErr(std::io::Error::other(e.to_string())))
+        } else {
+            self.snapshot
+                .get_owned(&self.ks().pages, PageKey::new(sid, pageidx))
+        }
     }
 
     /// Retrieve the `PageCount` of a Volume at a particular LSN.
@@ -479,8 +527,7 @@ impl<'a> ReadGuard<'a> {
         let mut iter = self.iter_visible_pages(snapshot);
         while let Some((idx, pageset)) = iter.try_next()? {
             for pageidx in pageset.iter() {
-                let key = PageKey::new(idx.sid.clone(), pageidx);
-                if let Some(page) = self.snapshot.get(&self.ks().pages, &key)? {
+                if let Some(page) = self.read_page(idx.sid.clone(), pageidx)? {
                     builder.write(&page);
                 }
             }
@@ -503,10 +550,7 @@ impl<'a> ReadGuard<'a> {
             // the first page, we are missing all the pages (in the frame)
             for frame in frames {
                 if let Some(first_page) = frame.pageset.first()
-                    && !self.snapshot.contains_key(
-                        &self.ks().pages,
-                        &PageKey::new(frame.sid.clone(), first_page),
-                    )?
+                    && !self.has_page(frame.sid.clone(), first_page)?
                 {
                     missing_frames.push(frame);
                 }
@@ -519,13 +563,23 @@ impl<'a> ReadGuard<'a> {
 pub struct WriteBatch<'a> {
     ks: &'a Keyspaces,
     batch: OwnedWriteBatch,
+    /// External page store, if configured
+    page_store: Option<&'a Arc<dyn PageStore>>,
+    /// Pages to write to external store, grouped by segment
+    pending_pages: BTreeMap<SegmentId, BTreeMap<PageIdx, Page>>,
 }
 
 impl<'a> WriteBatch<'a> {
     fn open(storage: &'a FjallStorage) -> Self {
         let ks = &storage.ks;
         let batch = storage.db.batch();
-        Self { ks, batch }
+        let page_store = storage.page_store.as_ref();
+        Self {
+            ks,
+            batch,
+            page_store,
+            pending_pages: BTreeMap::new(),
+        }
     }
 
     pub fn write_tag(&mut self, tag: &str, vid: VolumeId) {
@@ -563,11 +617,30 @@ impl<'a> WriteBatch<'a> {
     }
 
     pub fn write_page(&mut self, sid: SegmentId, pageidx: PageIdx, page: Page) {
-        self.batch
-            .insert_typed(&self.ks.pages, PageKey::new(sid, pageidx), page);
+        if self.page_store.is_some() {
+            // Collect pages for external page store
+            self.pending_pages
+                .entry(sid)
+                .or_default()
+                .insert(pageidx, page);
+        } else {
+            // Use internal fjall keyspace
+            self.batch
+                .insert_typed(&self.ks.pages, PageKey::new(sid, pageidx), page);
+        }
     }
 
     pub fn commit(self) -> Result<(), FjallStorageErr> {
+        // Write pages to external store first (if configured)
+        if let Some(page_store) = self.page_store {
+            for (sid, pages) in self.pending_pages {
+                page_store
+                    .write_segment(sid, pages)
+                    .map_err(|e| FjallStorageErr::IoErr(std::io::Error::other(e.to_string())))?;
+            }
+        }
+
+        // Then commit metadata to fjall
         Ok(self.batch.commit()?)
     }
 }
@@ -760,7 +833,7 @@ impl<'a> ReadWriteGuard<'a> {
         let volume = self.read.volume(vid)?;
 
         // verify the pending commit matches the remote commit
-        let pending_commit = volume.pending_commit.unwrap();
+        let pending_commit = volume.pending_commit.clone().unwrap();
         assert_eq!(remote_commit.lsn(), pending_commit.commit);
         assert_eq!(
             remote_commit.commit_hash(),
@@ -791,6 +864,11 @@ impl<'a> ReadWriteGuard<'a> {
         batch.write_commit(remote_commit);
         batch.write_volume(volume);
         batch.commit()?;
+
+        // NOTE: We intentionally do NOT clean up old local segments here.
+        // Active snapshots may still reference those segments. Cleanup should
+        // happen via the page store's pruning mechanisms (prune_lru, prune_to_size,
+        // compact_all) which can be called when the system is quiescent.
 
         Ok(())
     }
@@ -856,14 +934,14 @@ impl<'a> ReadWriteGuard<'a> {
         }
     }
 
-    pub fn sync_remote_to_local(self, vid: VolumeId) -> Result<(), FjallStorageErr> {
+    pub fn sync_remote_to_local(self, vid: VolumeId) -> Result<bool, FjallStorageErr> {
         let volume = self.read.volume(&vid)?;
 
         // check to see if we have any changes to sync
         let latest_remote = self.read.latest_lsn(&volume.remote)?;
         let Some(remote_changes) = volume.remote_changes(latest_remote) else {
             // nothing to sync
-            return Ok(());
+            return Ok(false);
         };
 
         // check for divergence
@@ -908,6 +986,8 @@ impl<'a> ReadWriteGuard<'a> {
         // update the sync point
         self.ks()
             .volumes
-            .insert(volume.vid.clone(), volume.with_sync(Some(new_sync)))
+            .insert(volume.vid.clone(), volume.with_sync(Some(new_sync)))?;
+
+        Ok(true)
     }
 }

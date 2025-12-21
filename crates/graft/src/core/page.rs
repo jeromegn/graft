@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::core::byte_unit::ByteUnit;
 
-pub const PAGESIZE: ByteUnit = ByteUnit::from_kb(4);
+pub const PAGESIZE: ByteUnit = ByteUnit::from_kb(16);
 static_assertions::const_assert!(PAGESIZE.is_power_of_two());
 
 static STATIC_EMPTY_PAGE: [u8; PAGESIZE.as_usize()] = [0; PAGESIZE.as_usize()];

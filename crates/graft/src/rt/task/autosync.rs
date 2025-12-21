@@ -18,11 +18,12 @@ use crate::{
 
 pub struct AutosyncTask {
     ticker: Interval,
+    sender: tokio::sync::mpsc::Sender<VolumeId>,
 }
 
 impl AutosyncTask {
-    pub fn new(ticker: Interval) -> Self {
-        Self { ticker }
+    pub fn new(ticker: Interval, sender: tokio::sync::mpsc::Sender<VolumeId>) -> Self {
+        Self { ticker, sender }
     }
 }
 
@@ -98,7 +99,12 @@ impl Task for AutosyncTask {
                                 .await
                         }
                         Subtask::Pull { vid } => {
-                            Ok(storage.read_write().sync_remote_to_local(vid)?)
+                            if storage.read_write().sync_remote_to_local(vid.clone())? {
+                                if let Err(e) = self.sender.try_send(vid) {
+                                    tracing::warn!(error = %e, "could not send volume id");
+                                }
+                            }
+                            Ok(())
                         }
                     }
                 })

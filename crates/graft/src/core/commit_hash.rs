@@ -243,7 +243,7 @@ mod tests {
                 lsn: lsn!(42),
                 page_count: PageCount::new(1),
                 pages: vec![(pageidx!(1), Page::test_filled(0xAA))],
-                expected_hash: "5Zx7fz5utSpLyJvurgLiQGHzdNHH4Wwk1BoxoyfR3C5j",
+                expected_hash: "5XbiVkmK1b2NXKB9BVNfrwtMDTXtBf83usKCGLHCW7gm",
             },
             TestCase {
                 name: "multiple_pages",
@@ -254,7 +254,7 @@ mod tests {
                     (pageidx!(1), Page::test_filled(0x11)),
                     (pageidx!(2), Page::test_filled(0x22)),
                 ],
-                expected_hash: "5Xsk16UBYSSQ75xbikQfTHykWpbVv3az1ncaFGajqjhe",
+                expected_hash: "5a54FXW2foJ7Ra56koqg9dmwMDsWwXji5zGmaAc1Tc7m",
             },
         ];
 

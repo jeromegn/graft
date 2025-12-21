@@ -43,17 +43,17 @@ impl Runtime {
         tokio_rt: tokio::runtime::Handle,
         remote: Arc<Remote>,
         storage: Arc<FjallStorage>,
-        autosync: Option<Duration>,
+        autosync: Option<(Duration, tokio::sync::mpsc::Sender<VolumeId>)>,
     ) -> Runtime {
         // spin up background tasks as needed
-        if let Some(interval) = autosync {
+        if let Some((interval, sender)) = autosync {
             let _guard = tokio_rt.enter();
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tokio_rt.spawn(supervise(
                 storage.clone(),
                 remote.clone(),
-                AutosyncTask::new(ticker),
+                AutosyncTask::new(ticker, sender),
             ));
         }
         Runtime {
@@ -68,19 +68,41 @@ impl Runtime {
     pub(crate) fn read_page(&self, snapshot: &Snapshot, pageidx: PageIdx) -> Result<Page> {
         let reader = self.storage().read();
         if let Some(commit) = reader.search_page(snapshot, pageidx)? {
+            tracing::debug!(?pageidx, ?snapshot, log = ?commit.log(),
+            lsn = ?commit.lsn(),
+            page_count = ?commit.page_count(),
+            sid = ?commit.segment_idx().map(|s| s.sid()), "found a page");
             let idx = commit
                 .segment_idx()
                 .expect("BUG: commit claims to contain pageidx");
 
             if let Some(page) = reader.read_page(idx.sid().clone(), pageidx)? {
+                tracing::debug!(
+                    ?pageidx,
+                    log = ?commit.log(),
+                    lsn = ?commit.lsn(),
+                    page_count = ?commit.page_count(),
+                    sid = ?commit.segment_idx().map(|s| s.sid()),
+                    "already had page"
+                );
                 return Ok(page);
             }
 
-            // fallthrough to loading the page from the remote
-            let range = idx
-                .frame_for_pageidx(pageidx)
-                .expect("BUG: no frame for pageidx");
+            // Page not in local storage - try to fetch from remote.
+            // Only remote commits have frames; local commits should always
+            // have their pages in local storage.
+            let Some(range) = idx.frame_for_pageidx(pageidx) else {
+                // This is a local commit without frames - the page should
+                // have been in local storage. This indicates data loss or
+                // corruption (e.g., page store out of sync with metadata).
+                return Err(crate::LogicalErr::MissingPage {
+                    sid: idx.sid().clone(),
+                    pageidx,
+                }
+                .into());
+            };
 
+            tracing::debug!(?range, "running action to fetch segment");
             // fetch the segment frame containing the page
             self.run_action(FetchSegment { range })?;
 
@@ -183,10 +205,11 @@ impl Runtime {
         if volume.pending_commit.is_some() {
             self.storage().read_write().recover_pending_commit(&vid)?;
         }
-        Ok(self
-            .storage()
+
+        self.storage()
             .read_write()
-            .sync_remote_to_local(volume.vid)?)
+            .sync_remote_to_local(volume.vid)?;
+        Ok(())
     }
 
     pub fn volume_push(&self, vid: VolumeId) -> Result<()> {
@@ -290,11 +313,19 @@ mod tests {
 
         let remote = Arc::new(RemoteConfig::Memory.build().unwrap());
         let storage = Arc::new(FjallStorage::open_temporary().unwrap());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        tokio_rt.spawn(async move {
+            while let Some(_vid) = rx.recv().await {
+                // drain...
+            }
+        });
+
         let runtime = Runtime::new(
             tokio_rt.handle().clone(),
             remote.clone(),
             storage,
-            Some(Duration::from_secs(1)),
+            Some((Duration::from_secs(1), tx.clone())),
         );
 
         let remote_log = LogId::random();
@@ -335,7 +366,7 @@ mod tests {
             tokio_rt.handle().clone(),
             remote.clone(),
             storage,
-            Some(Duration::from_secs(1)),
+            Some((Duration::from_secs(1), tx)),
         );
 
         // open the same remote log in the second runtime

@@ -1,4 +1,4 @@
-use crate::core::{LogId, VolumeId};
+use crate::core::{LogId, PageIdx, SegmentId, VolumeId};
 use crate::{local::fjall_storage::FjallStorageErr, remote::RemoteErr};
 
 #[derive(Debug, thiserror::Error)]
@@ -44,4 +44,7 @@ pub enum LogicalErr {
         expected: LogId,
         actual: LogId,
     },
+
+    #[error("Missing page {pageidx} in segment {sid} (page store out of sync with metadata)")]
+    MissingPage { sid: SegmentId, pageidx: PageIdx },
 }

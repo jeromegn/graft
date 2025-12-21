@@ -16,16 +16,20 @@ impl PageSet {
         splinter: CowSplinter::Owned(Splinter::EMPTY),
     };
 
+    /// Note: This uses Splinter::FULL which includes 0. Any operations that
+    /// create new PageSets from FULL (like `cut`) will strip out 0 via `new()`.
     pub const FULL: Self = Self {
         splinter: CowSplinter::Owned(Splinter::FULL),
     };
 
     #[inline]
-    pub fn new(splinter: CowSplinter<Bytes>) -> Self {
-        assert!(
-            !splinter.contains(0),
-            "Invalid PageSet: Splinter contains PageIdx 0"
-        );
+    pub fn new(mut splinter: CowSplinter<Bytes>) -> Self {
+        // PageIdx is 1-based, so 0 should never be in a PageSet.
+        // Remove it if present (e.g., from corrupted/old data).
+        if splinter.contains(0) {
+            tracing::warn!("PageSet contained invalid PageIdx 0, removing it");
+            splinter.remove(0);
+        }
         Self { splinter }
     }
 

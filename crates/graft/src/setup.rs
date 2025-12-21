@@ -54,6 +54,14 @@ pub fn setup_graft(config: GraftConfig) -> Result<Runtime, InitErr> {
 
     let remote = Arc::new(config.remote.build()?);
     let storage = Arc::new(FjallStorage::open(config.data_dir)?);
-    let autosync = config.autosync.map(|s| Duration::from_secs(s.get()));
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        while let Some(_vid) = rx.recv().await {
+            // drain...
+        }
+    });
+
+    let autosync = config.autosync.map(|s| (Duration::from_secs(s.get()), tx));
     Ok(Runtime::new(tokio_handle, remote, storage, autosync))
 }
