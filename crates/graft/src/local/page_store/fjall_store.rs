@@ -49,6 +49,29 @@ impl FjallPageStore {
     }
 }
 
+impl FjallPageStore {
+    /// Access a page's data via callback.
+    ///
+    /// Note: FjallPageStore doesn't support true zero-copy reads since the
+    /// LSM-tree returns owned data. This method reads the page and calls
+    /// the callback with a reference to it.
+    pub fn with_page<F, R>(
+        &self,
+        sid: &SegmentId,
+        pageidx: PageIdx,
+        f: F,
+    ) -> Result<Option<R>, PageStoreErr>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let snapshot = self.db.snapshot();
+        match snapshot.get_owned(&self.pages, PageKey::new(sid.clone(), pageidx))? {
+            Some(page) => Ok(Some(f(page.as_ref()))),
+            None => Ok(None),
+        }
+    }
+}
+
 impl PageStore for FjallPageStore {
     fn has_page(&self, sid: &SegmentId, pageidx: PageIdx) -> Result<bool, PageStoreErr> {
         let snapshot = self.db.snapshot();

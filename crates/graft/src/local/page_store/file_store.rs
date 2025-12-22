@@ -28,7 +28,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,7 +36,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::DashMap;
-use memmap2::Mmap;
+use memmap2::MmapMut;
 use parking_lot::RwLock;
 use splinter_rs::{CowSplinter, PartitionRead};
 use zerocopy::IntoBytes;
@@ -193,6 +193,24 @@ impl Drop for FileLock {
     }
 }
 
+/// Cross-process lock constants.
+/// Lock byte is stored at offset 0 of each pack file.
+/// Bit 7 = compact pending, bits 0-6 = reader count (max 127 concurrent readers).
+const LOCK_COMPACT_BIT: u8 = 0x80;
+const LOCK_COUNT_MASK: u8 = 0x7F;
+
+/// RAII guard for read access to a shard's lock byte
+struct ShardReadGuard<'a> {
+    state: &'a AtomicU8,
+}
+
+impl Drop for ShardReadGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.state.fetch_sub(1, Ordering::Release);
+    }
+}
+
 use crate::core::{
     PageIdx, SegmentId,
     page::{PAGESIZE, Page},
@@ -203,6 +221,9 @@ use super::{PageStore, PageStoreErr};
 
 /// Magic bytes identifying a segment
 const MAGIC: &[u8; 8] = b"GRAFTSG\x01";
+
+/// Size of the file header (lock byte)
+const FILE_HEADER_SIZE: usize = 1;
 
 /// Size of the magic + splinter size header (before SegmentId)
 const HEADER_PREFIX_SIZE: usize = 8 + 4;
@@ -219,12 +240,59 @@ const MIN_MMAP_CAPACITY: u64 = 64 * 1024 * 1024;
 /// Cached pack file with mmap and segment index.
 /// Uses DashMap for lock-free concurrent access to segments.
 struct CachedPack {
-    mmap: Mmap,
+    /// Mutable mmap - needed for atomic lock byte at offset 0
+    mmap: MmapMut,
     /// The capacity of the mmap (may be larger than actual data)
     capacity: u64,
     /// Segment index: SegmentId -> (offset_in_mmap, data_offset, pageset)
     /// DashMap allows lock-free reads and concurrent inserts without cloning.
     segments: DashMap<SegmentId, (usize, usize, Arc<PageSet>)>,
+}
+
+impl CachedPack {
+    /// Get the lock byte as an atomic reference
+    #[inline]
+    fn lock_state(&self) -> &AtomicU8 {
+        // SAFETY: mmap is at least FILE_HEADER_SIZE bytes, and we only access
+        // through atomics which handle concurrent access correctly.
+        unsafe { &*(self.mmap.as_ptr() as *const AtomicU8) }
+    }
+
+    /// Acquire read access. Returns a guard that releases on drop.
+    #[inline]
+    fn read_acquire(&self) -> ShardReadGuard<'_> {
+        let state = self.lock_state();
+        loop {
+            let old = state.fetch_add(1, Ordering::Acquire);
+            if old & LOCK_COMPACT_BIT == 0 {
+                // No compaction pending, we're good
+                break;
+            }
+            // Compaction pending, undo and wait
+            state.fetch_sub(1, Ordering::Release);
+            while state.load(Ordering::Relaxed) & LOCK_COMPACT_BIT != 0 {
+                std::hint::spin_loop();
+            }
+        }
+        ShardReadGuard { state }
+    }
+
+    /// Acquire exclusive access for compaction. Blocks until all readers finish.
+    fn compact_acquire(&self) {
+        let state = self.lock_state();
+        // Set compact bit
+        state.fetch_or(LOCK_COMPACT_BIT, Ordering::SeqCst);
+        // Wait for readers to drain
+        while state.load(Ordering::Acquire) & LOCK_COUNT_MASK != 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Release exclusive access after compaction
+    fn compact_release(&self) {
+        let state = self.lock_state();
+        state.fetch_and(!LOCK_COMPACT_BIT, Ordering::Release);
+    }
 }
 
 /// Per-shard configuration (immutable after init)
@@ -267,6 +335,10 @@ struct ShardAccessTimes {
 /// Read path is lock-free via ArcSwap + DashMap for the cache.
 /// Write path uses pwritev for concurrent writes without mutex.
 /// Mmap is pre-extended to reduce remapping frequency.
+///
+/// Each pack file has a 1-byte header for cross-process synchronization:
+/// - Bit 7: compact pending flag
+/// - Bits 0-6: reader count (max 127 concurrent readers)
 pub struct FilePageStore {
     /// Root directory for pack files
     #[allow(dead_code)]
@@ -279,9 +351,6 @@ pub struct FilePageStore {
     writers: Vec<RwLock<Option<ShardWriter>>>,
     /// Per-shard access times
     access_times: Vec<ShardAccessTimes>,
-    /// Global index: SegmentId -> shard number (for has_segment)
-    /// Uses DashMap for lock-free concurrent access.
-    index: DashMap<SegmentId, u8>,
 }
 
 impl FilePageStore {
@@ -327,10 +396,9 @@ impl FilePageStore {
             caches,
             writers,
             access_times: access_times_vec,
-            index: DashMap::new(),
         };
 
-        // Rebuild index from existing pack files
+        // Load existing pack files into cache
         store.rebuild_index()?;
 
         Ok(store)
@@ -427,7 +495,7 @@ impl FilePageStore {
         sid.as_bytes()[7]
     }
 
-    /// Rebuild the in-memory index by scanning all pack files
+    /// Load all existing pack files into the in-memory cache
     fn rebuild_index(&self) -> Result<(), PageStoreErr> {
         for shard_num in 0..NUM_SHARDS {
             let config = &self.configs[shard_num];
@@ -436,21 +504,22 @@ impl FilePageStore {
             }
 
             let metadata = fs::metadata(&config.path)?;
-            if metadata.len() == 0 {
+            // Skip files without even a header
+            if metadata.len() < FILE_HEADER_SIZE as u64 {
                 continue;
             }
 
             // Scan the pack file to find all segments
-            let file = File::open(&config.path)?;
-            // SAFETY: The file is open and valid. We only read from the mmap.
-            // Initialization happens before any concurrent access.
-            let mmap = unsafe { Mmap::map(&file)? };
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config.path)?;
+            // SAFETY: The file is open and valid. We need write access for the
+            // atomic lock byte. Initialization happens before any concurrent access.
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
             let capacity = mmap.len() as u64;
 
             let segments = Self::scan_pack(&mmap, &config.path)?;
-            for (sid, _, _, _) in &segments {
-                self.index.insert(sid.clone(), shard_num as u8);
-            }
 
             // Build cached pack with DashMap
             let seg_map = DashMap::new();
@@ -470,13 +539,15 @@ impl FilePageStore {
     }
 
     /// Scan a pack file and return all segments found.
-    /// Format per segment: magic(8) + splinter_size(4) + segment_id(16) + splinter(var) + pages
+    /// Format: file_header(1) + [segment...]
+    /// Each segment: magic(8) + splinter_size(4) + segment_id(16) + splinter(var) + pages
     fn scan_pack(
         mmap: &[u8],
         _path: &Path,
     ) -> Result<Vec<(SegmentId, usize, usize, PageSet)>, PageStoreErr> {
         let mut segments = Vec::new();
-        let mut offset = 0;
+        // Start after file header (lock byte)
+        let mut offset = FILE_HEADER_SIZE;
 
         let min_header = HEADER_PREFIX_SIZE + SEGMENT_ID_SIZE;
 
@@ -570,27 +641,30 @@ impl FilePageStore {
             return Ok(None);
         }
 
-        // Nothing to load if file doesn't exist or is empty
+        // Nothing to load if file doesn't exist or is too small
         if !config.path.exists() {
             return Ok(None);
         }
 
-        // Load the pack file
-        let file = File::open(&config.path)?;
+        // Load the pack file with read/write access for atomic lock byte
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config.path)?;
         let metadata = file.metadata()?;
-        if metadata.len() == 0 {
+        if metadata.len() < FILE_HEADER_SIZE as u64 {
             return Ok(None);
         }
 
-        // SAFETY: The file is open and valid. We only read from the mmap.
-        // Handle EINVAL gracefully - can happen if file was truncated to 0 between
-        // our length check and mmap call (race with compaction).
-        let mmap = match unsafe { Mmap::map(&file) } {
+        // SAFETY: The file is open and valid. We need write access for atomic
+        // lock byte at offset 0. Handle EINVAL gracefully - can happen if file
+        // was truncated between our length check and mmap call (race with compaction).
+        let mmap = match unsafe { MmapMut::map_mut(&file) } {
             Ok(m) => m,
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
                 // EINVAL from mmap typically means length is 0.
                 // Verify the file is actually empty before returning None.
-                if file.metadata().map(|m| m.len()).unwrap_or(1) == 0 {
+                if file.metadata().map(|m| m.len()).unwrap_or(1) < FILE_HEADER_SIZE as u64 {
                     return Ok(None);
                 }
                 // File is non-empty but mmap still failed - this is unexpected
@@ -624,15 +698,24 @@ impl FilePageStore {
     }
 }
 
-impl PageStore for FilePageStore {
-    fn has_page(&self, sid: &SegmentId, pageidx: PageIdx) -> Result<bool, PageStoreErr> {
-        match self.get_segment(sid)? {
-            Some((_, _, _, pageset)) => Ok(pageset.contains(pageidx)),
-            None => Ok(false),
-        }
-    }
-
-    fn read_page(&self, sid: &SegmentId, pageidx: PageIdx) -> Result<Option<Page>, PageStoreErr> {
+impl FilePageStore {
+    /// Access a page's data via callback without copying.
+    ///
+    /// The callback receives a slice to the page data. The slice is only valid
+    /// for the duration of the callback - any data needed after must be copied
+    /// by the caller.
+    ///
+    /// This is the preferred method for read-only access as it avoids copying
+    /// and ensures proper lock management.
+    pub fn with_page<F, R>(
+        &self,
+        sid: &SegmentId,
+        pageidx: PageIdx,
+        f: F,
+    ) -> Result<Option<R>, PageStoreErr>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
         let (cached, seg_offset, data_offset, pageset) = match self.get_segment(sid)? {
             Some(s) => s,
             None => return Ok(None),
@@ -641,6 +724,9 @@ impl PageStore for FilePageStore {
         if !pageset.contains(pageidx) {
             return Ok(None);
         }
+
+        // Acquire cross-process read lock
+        let _guard = cached.read_acquire();
 
         // Calculate page offset within segment
         let rank = pageset.splinter().rank(pageidx.to_u32()) - 1;
@@ -653,9 +739,25 @@ impl PageStore for FilePageStore {
             ));
         }
 
-        let page_bytes = Bytes::copy_from_slice(&cached.mmap[page_offset..page_end]);
-        let page = Page::try_from(page_bytes).expect("buffer is exactly PAGESIZE");
-        Ok(Some(page))
+        // Call the callback with a slice - lock is held for duration of callback
+        let slice = &cached.mmap[page_offset..page_end];
+        Ok(Some(f(slice)))
+        // _guard dropped here, releasing the lock
+    }
+}
+
+impl PageStore for FilePageStore {
+    fn has_page(&self, sid: &SegmentId, pageidx: PageIdx) -> Result<bool, PageStoreErr> {
+        match self.get_segment(sid)? {
+            Some((_, _, _, pageset)) => Ok(pageset.contains(pageidx)),
+            None => Ok(false),
+        }
+    }
+
+    fn read_page(&self, sid: &SegmentId, pageidx: PageIdx) -> Result<Option<Page>, PageStoreErr> {
+        self.with_page(sid, pageidx, |slice| {
+            Page::try_from(slice).expect("slice is exactly PAGESIZE")
+        })
     }
 
     fn write_segment(
@@ -677,16 +779,16 @@ impl PageStore for FilePageStore {
         let splinter_bytes = pageset.splinter().encode_to_bytes();
         let splinter_size = splinter_bytes.len() as u32;
 
-        // Extended header: magic + splinter_size + segment_id + splinter
+        // Segment header: magic + splinter_size + segment_id + splinter
         let sid_bytes = sid.as_bytes();
-        let mut header =
+        let mut seg_header =
             Vec::with_capacity(HEADER_PREFIX_SIZE + SegmentId::SIZE.as_usize() + splinter_bytes.len());
-        header.extend_from_slice(MAGIC);
-        header.extend_from_slice(&splinter_size.to_le_bytes());
-        header.extend_from_slice(sid_bytes);
-        header.extend_from_slice(&splinter_bytes);
+        seg_header.extend_from_slice(MAGIC);
+        seg_header.extend_from_slice(&splinter_size.to_le_bytes());
+        seg_header.extend_from_slice(sid_bytes);
+        seg_header.extend_from_slice(&splinter_bytes);
 
-        let data_offset = header.len();
+        let data_offset = seg_header.len();
         let segment_size = (data_offset + pages.len() * PAGESIZE.as_usize()) as u64;
 
         // Ensure writer is initialized
@@ -696,8 +798,26 @@ impl PageStore for FilePageStore {
         let writer_guard = self.writers[shard_num].read();
         let writer = writer_guard.as_ref().unwrap();
 
-        // Atomically reserve space
-        let seg_offset = writer.data_size.fetch_add(segment_size, Ordering::SeqCst);
+        // Atomically reserve space. New files start at FILE_HEADER_SIZE (after lock byte).
+        // CAS loop to handle the case where we need to initialize from 0 to FILE_HEADER_SIZE.
+        let seg_offset = loop {
+            let current = writer.data_size.load(Ordering::SeqCst);
+            let start = if current < FILE_HEADER_SIZE as u64 {
+                FILE_HEADER_SIZE as u64
+            } else {
+                current
+            };
+            let new_size = start + segment_size;
+            match writer.data_size.compare_exchange(
+                current,
+                new_size,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break start,
+                Err(_) => continue,
+            }
+        };
         let new_data_size = seg_offset + segment_size;
 
         // Check if we need to extend the file and remap
@@ -729,10 +849,13 @@ impl PageStore for FilePageStore {
                         return Err(PageStoreErr::Io(std::io::Error::last_os_error()));
                     }
 
-                    // Create new mmap with larger capacity
-                    let file_for_mmap = File::open(&config.path)?;
-                    // SAFETY: The file is open and valid. We only read from the mmap.
-                    let new_mmap = unsafe { Mmap::map(&file_for_mmap)? };
+                    // Create new mmap with larger capacity (read/write for lock byte)
+                    let file_for_mmap = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&config.path)?;
+                    // SAFETY: The file is open and valid. We need write for atomic lock byte.
+                    let new_mmap = unsafe { MmapMut::map_mut(&file_for_mmap)? };
                     let new_capacity = new_mmap.len() as u64;
 
                     // Create new DashMap, copying entries from old cache if it exists
@@ -759,23 +882,23 @@ impl PageStore for FilePageStore {
         // Note: No lock needed - pwritev writes to fd directly, unaffected by ftruncate/mmap
         let page_refs: Vec<&[u8]> = pages.values().map(|p| p.as_ref()).collect();
         let mut data_slices: Vec<&[u8]> = Vec::with_capacity(1 + page_refs.len());
-        data_slices.push(&header);
+        data_slices.push(&seg_header);
         data_slices.extend(page_refs);
 
         // Write using pwritev (thread-safe, no seek needed)
         pwritev_all(writer.fd, seg_offset, &data_slices)?;
-
-        // Update global index (lock-free via DashMap)
-        self.index.insert(sid.clone(), shard_num as u8);
 
         // Update cache - insert into DashMap
         if let Some(cached) = self.caches[shard_num].load_full() {
             cached.segments.insert(sid.clone(), (seg_offset as usize, data_offset, Arc::new(pageset)));
         } else {
             // No cache exists yet, need to create one
-            let file_for_mmap = File::open(&config.path)?;
-            // SAFETY: The file is open and valid. We only read from the mmap.
-            let new_mmap = unsafe { Mmap::map(&file_for_mmap)? };
+            let file_for_mmap = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config.path)?;
+            // SAFETY: The file is open and valid. We need write for atomic lock byte.
+            let new_mmap = unsafe { MmapMut::map_mut(&file_for_mmap)? };
             let capacity = new_mmap.len() as u64;
             let segments = DashMap::new();
             segments.insert(sid.clone(), (seg_offset as usize, data_offset, Arc::new(pageset)));
@@ -795,7 +918,13 @@ impl PageStore for FilePageStore {
     }
 
     fn has_segment(&self, sid: &SegmentId) -> Result<bool, PageStoreErr> {
-        Ok(self.index.contains_key(sid))
+        // Check the cache for this shard - shard is derived from SegmentId itself
+        let shard_num = self.shard_for(sid) as usize;
+        if let Some(cached) = self.caches[shard_num].load_full() {
+            return Ok(cached.segments.contains_key(sid));
+        }
+        // No cache means no segments in this shard
+        Ok(false)
     }
 
     fn remove_segment(&self, sid: &SegmentId) -> Result<(), PageStoreErr> {
@@ -814,14 +943,11 @@ impl FilePageStore {
         self.access_times[shard_num].dirty.store(true, Ordering::Relaxed);
     }
 
-    /// Remove a segment from the in-memory index.
+    /// Remove a segment from the in-memory cache.
     /// The segment data remains in the pack file until compaction.
     pub fn remove_segment(&self, sid: &SegmentId) -> Result<(), PageStoreErr> {
-        // Remove from global index (lock-free via DashMap)
-        let shard_num = match self.index.remove(sid) {
-            Some((_, n)) => n as usize,
-            None => return Ok(()), // Already removed
-        };
+        // Shard is derived directly from SegmentId
+        let shard_num = self.shard_for(sid) as usize;
 
         // Remove from cache's DashMap (no need to rebuild the whole cache)
         if let Some(cached) = self.caches[shard_num].load_full() {
@@ -857,14 +983,18 @@ impl FilePageStore {
 
         let config = &self.configs[shard_num];
 
-        // Acquire exclusive file lock for compaction
+        // Acquire exclusive file lock for compaction (multi-process mutual exclusion)
         let _lock = FileLock::exclusive(&config.lock_path)?;
 
-        // Get live segments from cache
+        // Get current cache - if none exists, nothing to compact
         let cached = match self.caches[shard_num].load_full() {
             Some(c) => c,
-            None => return Ok(()), // No cache, nothing to compact
+            None => return Ok(()),
         };
+
+        // Acquire cross-process lock via the cached pack's lock byte.
+        // This blocks new readers and waits for existing readers to drain.
+        cached.compact_acquire();
 
         let live_segments: Vec<_> = cached
             .segments
@@ -876,7 +1006,18 @@ impl FilePageStore {
             .collect();
 
         if live_segments.is_empty() {
-            // All segments removed, truncate the file
+            // All segments removed. First release the lock and clear the cache,
+            // THEN truncate the file. This order is important because truncating
+            // the file invalidates the mmap, and we can't access the lock byte after that.
+            cached.compact_release();
+            self.caches[shard_num].store(None);
+
+            // Reset writer data_size
+            if let Some(writer) = self.writers[shard_num].read().as_ref() {
+                writer.data_size.store(0, Ordering::SeqCst);
+            }
+
+            // Truncate the file after clearing the cache
             if config.path.exists() {
                 OpenOptions::new()
                     .write(true)
@@ -884,19 +1025,13 @@ impl FilePageStore {
                     .set_len(0)?;
             }
 
-            // Reset writer data_size
-            if let Some(writer) = self.writers[shard_num].read().as_ref() {
-                writer.data_size.store(0, Ordering::SeqCst);
-            }
-
-            self.caches[shard_num].store(None);
             self.access_times[shard_num].times.clear();
             self.access_times[shard_num].dirty.store(true, Ordering::Relaxed);
             return Ok(());
         }
 
         // Read all live segment data from current mmap
-        let old_mmap = &cached.mmap;
+        let old_mmap: &[u8] = &cached.mmap;
         let mut segment_data: Vec<(SegmentId, Vec<u8>, usize, Arc<PageSet>)> = Vec::new();
 
         for (sid, offset, data_offset, pageset) in &live_segments {
@@ -914,7 +1049,7 @@ impl FilePageStore {
             }
         }
 
-        // Write to new temp file
+        // Write to new temp file with header
         let temp_path = config.path.with_extension("pack.tmp");
         let mut temp_file = OpenOptions::new()
             .read(true)
@@ -923,8 +1058,11 @@ impl FilePageStore {
             .truncate(true)
             .open(&temp_path)?;
 
+        // Write file header (lock byte, initialized to 0)
+        temp_file.write_all(&[0u8])?;
+
         let new_segments = DashMap::new();
-        let mut new_offset = 0usize;
+        let mut new_offset = FILE_HEADER_SIZE; // Start after header
         let mut new_access_times: Vec<(SegmentId, u64)> = Vec::new();
 
         for (sid, data, data_offset, pageset) in segment_data {
@@ -943,15 +1081,18 @@ impl FilePageStore {
         // Invalidate writer so it gets recreated with new fd
         *self.writers[shard_num].write() = None;
 
-        // Reopen and remap
-        let new_file = File::open(&config.path)?;
+        // Reopen and remap with read/write access for lock byte
+        let new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config.path)?;
 
-        // SAFETY: The file is open and valid. We only read from the mmap.
+        // SAFETY: The file is open and valid. We need write for atomic lock byte.
         // We hold the exclusive file lock.
-        let new_mmap = unsafe { Mmap::map(&new_file)? };
+        let new_mmap = unsafe { MmapMut::map_mut(&new_file)? };
         let capacity = new_mmap.len() as u64;
 
-        // Update cache atomically
+        // Update cache atomically with new pack
         self.caches[shard_num].store(Some(Arc::new(CachedPack {
             mmap: new_mmap,
             capacity,
@@ -964,6 +1105,10 @@ impl FilePageStore {
             self.access_times[shard_num].times.insert(sid, time);
         }
         self.access_times[shard_num].dirty.store(true, Ordering::Relaxed);
+
+        // Release cross-process lock on the OLD cached pack.
+        // This unblocks any readers that were waiting on the old pack.
+        cached.compact_release();
 
         Ok(())
     }
@@ -1082,7 +1227,11 @@ impl FilePageStore {
 
     /// Get the number of segments in the store.
     pub fn segment_count(&self) -> usize {
-        self.index.len()
+        self.caches
+            .iter()
+            .filter_map(|cache| cache.load_full())
+            .map(|cached| cached.segments.len())
+            .sum()
     }
 
     /// Get statistics about the store.
