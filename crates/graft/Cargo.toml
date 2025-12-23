@@ -25,6 +25,7 @@ circular-buffer = { workspace = true }
 dashmap = { workspace = true }
 fjall = { workspace = true }
 foldhash = { workspace = true }
+foyer = { workspace = true }
 futures = { workspace = true }
 hashbrown = { workspace = true }
 itertools = { workspace = true }

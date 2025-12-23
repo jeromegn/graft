@@ -3,16 +3,18 @@
 //! This module provides a trait [`PageStore`] and implementations for storing
 //! pages locally. Pages are 16KB blobs keyed by (SegmentId, PageIdx).
 //!
-//! Two implementations are provided:
-//! - [`FilePageStore`]: File-based storage with one file per segment
+//! Three implementations are provided:
+//! - [`FilePageStore`]: File-based storage using memory-mapped pack files
 //! - [`FjallPageStore`]: Wrapper around fjall's pages keyspace
+//! - [`FoyerStore`]: File-per-segment storage with foyer in-memory cache
 
 mod file_store;
 mod fjall_store;
+mod foyer_store;
 
 pub use file_store::FilePageStore;
 pub use fjall_store::FjallPageStore;
-// AnyPageStore not exported yet - will be used when callers migrate to it
+pub use foyer_store::{FoyerStore, FoyerStoreConfig};
 
 use std::collections::BTreeMap;
 
@@ -74,6 +76,7 @@ pub trait PageStore: Send + Sync {
 pub enum AnyPageStore {
     File(FilePageStore),
     Fjall(FjallPageStore),
+    Foyer(FoyerStore),
 }
 
 impl AnyPageStore {
@@ -97,6 +100,7 @@ impl AnyPageStore {
         match self {
             AnyPageStore::File(store) => store.with_page(sid, pageidx, f),
             AnyPageStore::Fjall(store) => store.with_page(sid, pageidx, f),
+            AnyPageStore::Foyer(store) => store.with_page(sid, pageidx, f),
         }
     }
 }
@@ -106,6 +110,7 @@ impl PageStore for AnyPageStore {
         match self {
             AnyPageStore::File(s) => s.has_page(sid, pageidx),
             AnyPageStore::Fjall(s) => s.has_page(sid, pageidx),
+            AnyPageStore::Foyer(s) => s.has_page(sid, pageidx),
         }
     }
 
@@ -113,6 +118,7 @@ impl PageStore for AnyPageStore {
         match self {
             AnyPageStore::File(s) => s.read_page(sid, pageidx),
             AnyPageStore::Fjall(s) => s.read_page(sid, pageidx),
+            AnyPageStore::Foyer(s) => s.read_page(sid, pageidx),
         }
     }
 
@@ -124,6 +130,7 @@ impl PageStore for AnyPageStore {
         match self {
             AnyPageStore::File(s) => s.write_segment(sid, pages),
             AnyPageStore::Fjall(s) => s.write_segment(sid, pages),
+            AnyPageStore::Foyer(s) => s.write_segment(sid, pages),
         }
     }
 
@@ -131,6 +138,7 @@ impl PageStore for AnyPageStore {
         match self {
             AnyPageStore::File(s) => s.has_segment(sid),
             AnyPageStore::Fjall(s) => s.has_segment(sid),
+            AnyPageStore::Foyer(s) => s.has_segment(sid),
         }
     }
 
@@ -138,6 +146,7 @@ impl PageStore for AnyPageStore {
         match self {
             AnyPageStore::File(s) => s.remove_segment(sid),
             AnyPageStore::Fjall(s) => s.remove_segment(sid),
+            AnyPageStore::Foyer(s) => s.remove_segment(sid),
         }
     }
 }
